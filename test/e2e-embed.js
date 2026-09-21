@@ -92,6 +92,7 @@ const foto = (nome) => { try { execFileSync('import', ['-window', 'root', path.j
 const focoX11 = () => { try { return execFileSync('xdotool', ['getwindowfocus'], { encoding: 'utf8' }).trim(); } catch (_) { return ''; } };
 
 let estado = [], pai = null;
+const voltas = []; // um registro por passe da volta do minimizado
 const painel = (n) => estado.find((p) => p.n === n) || {};
 
 srv.listen(0, '127.0.0.1', async () => {
@@ -116,6 +117,7 @@ srv.listen(0, '127.0.0.1', async () => {
       if (process.env.QV_DUMP) fs.appendFileSync(process.env.QV_DUMP, `${Math.round(process.uptime())}s ${l.slice(8)}\n`);
     }
     if (l.startsWith('QVPAI ')) pai = l.slice(6).trim();
+    if (l.startsWith('QVVOLTA ')) voltas.push(JSON.parse(l.slice(8)));
   }));
 
   const acao = (a, i, v) => fs.writeFileSync(path.join(APPDATA, 'acao.json'), JSON.stringify({ a, i, v, t: Date.now() }));
@@ -232,6 +234,12 @@ srv.listen(0, '127.0.0.1', async () => {
   checar('desligada, a extensão não roda mais nem depois de recarregar', sim.ext.length === extDepoisDeDesligar, `${extDepoisDeDesligar} -> ${sim.ext.length}`);
 
 
+  // A aba extra nao mora na grade: fora do modo abas ela fica escondida de verdade, nao so fora
+  // da area (a barra de titulo dela espiava pelos ultimos pixels do app).
+  const mapeada = (id) => { try { return /Map State:\s*IsViewable/.test(execFileSync('xwininfo', ['-id', String(id)], { encoding: 'utf8' })); } catch (_) { return false; } };
+  checar('na grade a aba extra fica escondida e as contas visíveis', !mapeada(estado[2].alca) && mapeada(estado[0].alca) && mapeada(estado[1].alca),
+    `extra=${mapeada(estado[2].alca)} conta1=${mapeada(estado[0].alca)}`);
+
   // modo abas: o painel escolhido ocupa a area inteira, abaixo da tira de abas
   acao('abas', 2);
   await sleep(5000);
@@ -239,6 +247,7 @@ srv.listen(0, '127.0.0.1', async () => {
   const gConta1 = geometria(estado[0].alca);
   checar('modo abas dá a área inteira pro painel da aba', !!gExtra && gExtra.x === 0 && gExtra.y === 44 + 34 && gExtra.w > 1500,
     JSON.stringify(gExtra));
+  checar('no modo abas a aba extra volta a aparecer', mapeada(estado[2].alca), `extra=${mapeada(estado[2].alca)}`);
   checar('os outros painéis continuam do mesmo tamanho, atrás', !!gConta1 && gConta1.w === gExtra.w && gConta1.h === gExtra.h,
     JSON.stringify(gConta1));
   foto('solo-abas.png');
@@ -255,6 +264,7 @@ srv.listen(0, '127.0.0.1', async () => {
   await sleep(4000);
   checar('volta pro grid 2x2', (() => { const g = geometria(estado[0].alca); return !!g && g.w < 900 && g.y === 44 + 28; })(),
     JSON.stringify(geometria(estado[0].alca)));
+  checar('e a aba extra some de novo', !mapeada(estado[2].alca) && mapeada(estado[0].alca), `extra=${mapeada(estado[2].alca)}`);
 
   // painel que sai do lugar sozinho (navegador redimensionando a janela) tem que voltar sozinho
   {
@@ -288,6 +298,7 @@ srv.listen(0, '127.0.0.1', async () => {
   // volta do minimizado: o app refaz o encaixe sozinho, e tudo tem que terminar no lugar e respondendo
   {
     const antes = geometria(painel('Conta 1').alca);
+    voltas.length = 0; // o show inicial tambem passa por aqui; conto so a partir desta volta
     acao('voltar-teste', 0);
     await sleep(6000);
     const depois = geometria(painel('Conta 1').alca);
@@ -296,6 +307,13 @@ srv.listen(0, '127.0.0.1', async () => {
       && depois.x === antes.x && depois.y === antes.y && depois.w === antes.w && depois.h === antes.h,
       `${JSON.stringify(antes)} -> ${JSON.stringify(depois)}`);
     checar('e continua respondendo ao app', painel('Conta 1').diag === 'ok', painel('Conta 1').diag || '');
+    // As piscadas vinham de reencaixar (redimensionar + repintar) todos os paineis em cada passe
+    // da volta. Agora a volta so confere e levanta: nenhum passe forca a danca, e os paineis que ja
+    // estavam no lugar continuam no lugar sem ela.
+    const passes = voltas.slice();
+    checar('a volta do minimizado não redimensiona nem repinta painel que já está no lugar',
+      passes.length >= 2 && passes.every((v) => v.completos === 0 && v.todosNoLugar === true && v.paineis === 3),
+      JSON.stringify(passes));
   }
 
   // o aviso nao pode flutuar sobre painel encaixado: ele ocupa faixa propria e empurra os paineis

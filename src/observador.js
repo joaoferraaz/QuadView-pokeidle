@@ -33,7 +33,10 @@
   if (OrigAC) {
     const WrapAC = function (...args) {
       const c = new OrigAC(...args);
+      // Jogo que cria um contexto por efeito faria esta lista crescer para sempre, e cada contexto
+      // preso aqui nunca seria liberado. Guardo os ultimos; mudo/desmudo valem para esses.
       contextos.push(c);
+      if (contextos.length > 8) contextos.splice(0, contextos.length - 8);
       if (est.mudo) { try { c.suspend(); } catch (_) {} }
       return c;
     };

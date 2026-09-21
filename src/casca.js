@@ -185,12 +185,6 @@ window.quad.onEstado((s) => {
   });
 });
 
-window.quad.onAviso((t) => {
-  const el = document.getElementById('aviso');
-  el.textContent = t; el.hidden = false;
-  setTimeout(() => { el.hidden = true; }, 9000);
-});
-
 document.getElementById('topo').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-g]');
   if (!b) return;

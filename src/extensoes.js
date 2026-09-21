@@ -241,6 +241,13 @@ function embrulho(padroes, origens, marca, cedo, rodar) {
 // So o comeco do endereco (esquema e dominio) de um @match: serve para saber se vale vigiar esta pagina.
 const origemDoPadrao = (padrao) => matchParaRegex(String(padrao).replace(/^([^:]+:\/\/[^/]*).*$/, '$1/*'));
 
+// O texto final injetado (embrulho + script) sai caro de montar: percorre o cabecalho, converte cada
+// @match e cria uma string de algumas centenas de kB. Guardo o resultado por hash conferido. A
+// conferencia em si NAO e pulada: o arquivo e lido e comparado com o hash do download a cada chamada,
+// senao um arquivo mexido por fora (mantendo data e tamanho) passaria batido. O que o cache evita e
+// remontar o mesmo texto, e ele tambem faz os paineis compartilharem a mesma string.
+const montadas = new Map(); // id -> { sha256, fonte }
+
 // A copia em disco e conferida contra o hash guardado na hora do download: arquivo mexido por fora
 // nao roda.
 function fontesAtivas() {
@@ -250,7 +257,10 @@ function fontesAtivas() {
     if (!e || !e.ativa || !instalada(c.id)) continue;
     let fonte;
     try { fonte = fs.readFileSync(arqFonte(c.id), 'utf8'); } catch (_) { continue; }
-    if (crypto.createHash('sha256').update(fonte).digest('hex') !== e.sha256) continue;
+    const sha = crypto.createHash('sha256').update(fonte).digest('hex');
+    if (sha !== e.sha256) continue;
+    const pronta = montadas.get(c.id);
+    if (pronta && pronta.sha256 === sha) { saida.push({ id: c.id, marca: sha, fonte: pronta.fonte }); continue; }
     const v = validar(fonte);
     if (!v.ok) continue;
     const brutos = [...v.meta.match, ...v.meta.include];
@@ -258,11 +268,10 @@ function fontesAtivas() {
     // A injecao do app acontece sempre no comeco do documento. Script que NAO pede document-start
     // espera encontrar a pagina montada, entao nesse caso o embrulho segura ate o DOM ficar pronto.
     const cedo = v.meta['run-at'] === 'document-start';
-    saida.push({
-      id: c.id,
-      fonte: `(${embrulho.toString()})(${JSON.stringify(brutos.map(matchParaRegex))},${JSON.stringify(brutos.map(origemDoPadrao))},`
-        + `${JSON.stringify(marca)},${cedo},function(){\n${fonte}\n});`,
-    });
+    const texto = `(${embrulho.toString()})(${JSON.stringify(brutos.map(matchParaRegex))},${JSON.stringify(brutos.map(origemDoPadrao))},`
+      + `${JSON.stringify(marca)},${cedo},function(){\n${fonte}\n});`;
+    montadas.set(c.id, { sha256: sha, fonte: texto });
+    saida.push({ id: c.id, marca: sha, fonte: texto });
   }
   return saida;
 }

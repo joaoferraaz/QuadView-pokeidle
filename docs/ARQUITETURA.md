@@ -48,6 +48,16 @@ O encaixe é `SetParent` mais troca de estilo para `WS_CHILD`. O resto desta se�
 
 **Voltar do minimizado.** O evento de restaurar chega antes de a janela estar de pé, e mexer nos painéis nessa hora não tem efeito. A recuperação roda com atraso, em 250 ms e de novo em 1,1 s. O navegador também abre com `--disable-features=CalculateNativeWinOcclusion`, senão ele acha que está encoberto e para de desenhar.
 
+**Repintar é piscar.** A volta do minimizado chegou a ter seis passes (restore, show e focus disparam juntos, cada um com dois tempos), e cada passe reencaixava os quatro painéis com redimensionamento e `RedrawWindow`. Some disso vinha `SetWindowRgn`, que não compara: com redraw ele invalida a janela inteira mesmo quando a região é a mesma, e ele rodava em todo layout, inclusive na ronda de 10 segundos. E redimensionar uma janela do Chrome, mesmo por 8 pixels, faz o compositor dele refazer a superfície: um quadro em branco por painel. Regras atuais: a volta do minimizado só confere pai, posição, tamanho e visibilidade (`NoLugar`) e levanta o painel; a "dança" completa de reencaixe (encolhe, cresce, recorta, redesenha) fica para painel que estiver de fato fora do lugar, e nela o tamanho intermediário não é pintado. O congelamento que a dança curava é o que a flag `CalculateNativeWinOcclusion` desligada resolve.
+
+**O recorte é conferido, não lembrado.** `SetWindowRgn` não compara: com redraw ele invalida a janela inteira mesmo com a região igual. Mas guardar "já apliquei" também não serve: o Chrome mexe na região da própria janela quando ela muda de tamanho e zera a nossa (foi assim que as abas extras apareceram espiando pelos últimos pixels do app). A cada layout o app pergunta à janela (`GetWindowRgn` + `GetRgnBox`) e só reaplica quando o recorte não é o pedido.
+
+**Sobrepostos, só o da frente sobe.** No modo abas, e com um painel maximizado sobre a grade, os painéis ocupam o mesmo retângulo. Levantar todos a cada layout traz os de trás por um instante para a frente do visível, e o da frente é coberto e descoberto: era a piscada que só existia no modo abas. Nesses modos os de trás recebem `SWP_NOZORDER`; só o da frente vai para `HWND_TOP`. Na grade ninguém se sobrepõe e todos sobem, porque a janela invisível do app volta por cima deles depois de minimizar ou redimensionar.
+
+**Aba extra escondida de verdade.** Fora do modo abas, as abas extras não moram na grade. Antes eram empurradas para uma terceira linha, fora da área visível; agora recebem `ShowWindow(SW_HIDE)` e voltam com `SW_SHOWNA` ao entrar no modo abas. Escondidas, nada delas aparece e o navegador não gasta desenhando.
+
+**Achar a janela sem WMI.** A janela do navegador é procurada primeiro pelo processo que o app lançou (`EnumWindows` filtrado pelo PID, instantâneo). A consulta por perfil (`Win32_Process`, lenta, e seis painéis disputando a mesma fila do PowerShell) só entra quando esse processo já encerrou (um navegador aberto com o mesmo perfil assumiu a janela) ou depois de 8 segundos sem janela. Antes, a janela ficava segundos solta na tela e na barra de tarefas até ser encaixada. O que resta é o próprio Chrome: a janela dele existe como janela normal (com botão na barra de tarefas) até o app capturá-la, e isso não dá para evitar de fora; dá para encurtar, e a busca por processo roda a cada 100 ms.
+
 **Ronda.** A cada 10 segundos o app reposiciona os painéis e tenta reencaixar (até 6 vezes) o que falhou. Painel que a pessoa soltou de propósito fica solto.
 
 ## Teclado, a parte mais traiçoeira
@@ -83,11 +93,15 @@ O embrulho em volta de cada script faz o papel do gerenciador de userscripts:
 
 Proteções do lado do app: download só por HTTPS de `raw.githubusercontent.com`, sem seguir redirecionamento e com limite de tamanho; validação do cabeçalho; recusa de qualquer `@grant` que não seja `none`; troca atômica do arquivo (falha no meio mantém a versão anterior); SHA-256 guardado e conferido a cada carga; a janela de extensões só consegue abrir endereços do catálogo, nunca um endereço que venha dela.
 
+O texto final injetado (embrulho mais script) é guardado por hash, porque montá-lo percorre o cabeçalho, converte cada `@match` e cria uma string de centenas de kB, e os seis painéis pediam o dela separado. O que o cache **não** pula é a conferência: o arquivo é lido e comparado com o hash do download a cada chamada, senão uma cópia trocada por fora mantendo data e tamanho entraria sem ser vista. `test/extensoes-test.js` trava as duas metades dessa regra.
+
 Para adicionar uma extensão, inclua uma entrada em `CATALOGO`, em `src/extensoes.js`. Antes, leia o script: o que ele faz no jogo, para onde faz pedidos, se carrega código remoto.
 
 ## Segurança
 
-- Todas as janelas do app rodam com `contextIsolation`, `sandbox` e uma política de conteúdo que só aceita script local. Os canais sensíveis do IPC (acessos e extensões) conferem que o remetente é um arquivo do próprio app.
+- Todas as janelas do app rodam com `contextIsolation`, `sandbox` e uma política de conteúdo que só aceita script local. **Todos** os canais de IPC conferem que o remetente é uma janela do próprio app (`daCasca`). Antes a conferência estava só nos canais de acesso e extensões; configuração e abrir-pasta ficavam de fora, o que não era explorável hoje (a página do jogo não é um renderizador do Electron e não tem IPC nenhum) mas deixava uma porta aberta para o dia em que alguma janela carregasse conteúdo de fora.
+- Índice de painel vindo da casca é conferido antes de virar `paineis[i]`. Um índice fora da faixa numa ação derrubava o processo principal inteiro, ou seja, o app todo, por causa de um erro de uma janela só.
+- Endereço de painel salvo na configuração só pode ser `http`/`https`. Sem isso dava para gravar um `file://` que depois viraria o `--app=` do navegador.
 - Senhas são cifradas com `safeStorage` (DPAPI no Windows) e nunca saem do processo principal em claro para a casca.
 - A página do jogo não tem acesso a nenhum IPC do app.
 - A porta de depuração escuta só em 127.0.0.1. Ainda assim, enquanto o app está aberto, um programa local poderia se conectar a ela.
@@ -95,6 +109,15 @@ Para adicionar uma extensão, inclua uma entrada em `CATALOGO`, em `src/extensoe
 ## Desempenho
 
 A casca desliga a aceleração de vídeo (`app.disableHardwareAcceleration()`): ela é só texto, e isso devolve GPU e memória para os painéis (medido: de 11 processos e 660 MB para 6 processos e 522 MB). O grosso do consumo é o jogo em si, cerca de 1 GB por painel, e isso nenhuma casca resolve. Edge e Chrome têm o mesmo desempenho aqui: é o mesmo motor.
+
+Coisas que só aparecem com o app aberto por horas, e que valem a pena não reintroduzir:
+
+- **Rondas que se atropelam.** `rondaDeEstado` e `rondaDeJanelas` são assíncronas e vivem num `setInterval`, que não espera. Painel lento (a leitura de estado espera até 8 s) fazia a ronda seguinte começar por cima da anterior, e duas rondas juntas reinjetam o observador e disputam a mesma sessão. As duas têm trava de reentrada, como `posicionar` já tinha.
+- **Relógios de desistência desarmados.** Cada comando para a ponte do PowerShell e cada chamada à porta de depuração armava um `setTimeout` de 6 a 8 segundos que nunca era cancelado quando a resposta chegava. Com uma leitura por painel a cada 5 segundos, era uma fila de temporizadores vivos à toa. Agora chegou a resposta, o relógio cai.
+- **O vigia do clique dorme quando não há painel.** Ele acorda 40 vezes por segundo para ver se o botão do mouse desceu. Com todos os painéis fechados isso não servia para nada: a thread agora sai e o próximo encaixe a levanta de novo.
+- **Porta de depuração devolvida.** Navegador fechado por fora (a pessoa clica no X do Chrome) não passa por `fecharPainel`, e a porta reservada ficava marcada como em uso para sempre.
+- **Nada de segunda cópia do script por painel.** A sessão de cada painel guardava a fonte inteira da extensão para saber se mudou; agora guarda só o hash.
+- **Lista de contextos de áudio limitada** no observador: jogo que cria um contexto por efeito faria a lista crescer sem fim dentro da página.
 
 ## Empacotamento
 
@@ -111,3 +134,5 @@ O nome do pacote (`quadview-solo`) define a pasta de dados em `%APPDATA%`. Troca
 | `npm run test:e2e` | Sobe um jogo falso que cai de propósito e roda o app inteiro em Linux (Xvfb, xdotool, x11-utils, Chromium em `QV_CHROME`). |
 
 As chamadas da API do Windows não rodam no Linux. Por isso `test/win32-guard.js` lê o código e trava cada correção com o motivo ao lado: não rebaixar painel, quem gruda em quem, não desfazer o vínculo ao dar foco, não roubar primeiro plano, e assim por diante. É um teste mais fraco que executar, e o documento diz isso de propósito: mudança em `win32.ps1` precisa ser testada numa máquina Windows antes de virar versão.
+
+Duas guardas são contra o código morto voltar a se acumular: todo comando do `win32.ps1` tem de ter quem o chame em `janelas.js`, e toda função exportada por `janelas.js` tem de ser usada no `main.js`. Foi assim que `mover`, `recorte`, `acordar` e `reativar` sobreviveram depois de o reencaixe assumir o trabalho dos quatro. A guarda também recorta cada bloco de comando pelo *próximo* comando, seja qual for, em vez de ancorar no nome de um vizinho: ancorar pelo nome fazia remover um comando quebrar regras que não tinham nada a ver com ele.

@@ -133,11 +133,21 @@ ${extra}// ==/UserScript==
   const nova = await ext.baixar('piw-qol', async () => US().replace('9.10.12', '9.11.0'));
   ok('atualizar com versão nova troca a cópia e a versão', nova.ok && nova.mudou && ext.listar()[0].versao === '9.11.0');
 
+  // O texto injetado e guardado por hash para nao ser remontado a cada chamada (e para os paineis
+  // compartilharem a mesma string). Duas garantias: reaproveita mesmo, e troca quando a versao muda.
+  const a1 = ext.fontesAtivas()[0];
+  const a2 = ext.fontesAtivas()[0];
+  ok('o texto injetado é reaproveitado entre chamadas', a1.fonte === a2.fonte && a1.marca === a2.marca);
+  await ext.baixar('piw-qol', async () => US().replace('9.10.12', '9.12.0'));
+  const a3 = ext.fontesAtivas()[0];
+  ok('mas é remontado quando a cópia em disco muda', a3.marca !== a1.marca && a3.fonte.includes('9.12.0'));
+
   fs.appendFileSync(arq, '\n/* mexido por fora */');
+  // Esta e a que importa junto do cache: guardar o texto pronto NAO pode pular a conferencia do hash.
   ok('cópia em disco alterada por fora não roda (hash não confere)', ext.fontesAtivas().length === 0);
 
   ext.iniciar(dir);
-  ok('o estado sobrevive a fechar e abrir o app', ext.listar()[0].versao === '9.11.0');
+  ok('o estado sobrevive a fechar e abrir o app', ext.listar()[0].versao === '9.12.0');
 
   const fonteModulo = fs.readFileSync(path.join(__dirname, '..', 'src', 'extensoes.js'), 'utf8');
   ok('só baixa por https e só do GitHub do autor', /HOSTS_PERMITIDOS = \['raw\.githubusercontent\.com'\]/.test(fonteModulo) && /u\.protocol !== 'https:'/.test(fonteModulo));

@@ -21,7 +21,6 @@
     "productName": "QuadView",
     "files": [
       "src/**/*",
-      "config.json",
       "package.json",
       "build/icon.ico"
     ],

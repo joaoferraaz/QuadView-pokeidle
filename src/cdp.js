@@ -90,9 +90,11 @@ class Sessao {
     return new Promise((resolve) => {
       if (!this.ws || this.ws.readyState !== 1) return resolve(null);
       const id = ++this.seq;
-      this.esperando.set(id, (m) => resolve(m.result || null));
-      setTimeout(() => { if (this.esperando.delete(id)) resolve(null); }, 8000);
-      try { this.ws.send(JSON.stringify({ id, method, params })); } catch (_) { resolve(null); }
+      // Desarmo o relogio quando a resposta chega. Com uma leitura de estado a cada 5 s por painel,
+      // deixar temporizadores de 8 s vivos so acumulava trabalho para o laco de eventos.
+      const relogio = setTimeout(() => { if (this.esperando.delete(id)) resolve(null); }, 8000);
+      this.esperando.set(id, (m) => { clearTimeout(relogio); resolve(m.result || null); });
+      try { this.ws.send(JSON.stringify({ id, method, params })); } catch (_) { clearTimeout(relogio); resolve(null); }
     });
   }
 
@@ -113,12 +115,12 @@ class Sessao {
   // o identificador de cada uma para conseguir retirar quando a pessoa desliga. Vale a partir do
   // proximo carregamento da pagina: script que ja rodou nao tem como ser "desrodado".
   async sincronizarExtensoes(lista) {
-    if (!this.extensoes) this.extensoes = new Map(); // id -> { identificador, tamanho }
+    if (!this.extensoes) this.extensoes = new Map(); // id -> { identificador, marca }
     let mudou = false;
     const querida = new Map(lista.map((e) => [e.id, e]));
     for (const [id, reg] of [...this.extensoes]) {
       const nova = querida.get(id);
-      if (nova && nova.fonte.length === reg.tamanho && nova.fonte === reg.fonte) continue;
+      if (nova && nova.marca === reg.marca) continue;
       await this.enviar('Page.removeScriptToEvaluateOnNewDocument', { identifier: reg.identificador });
       this.extensoes.delete(id);
       mudou = true;
@@ -126,7 +128,9 @@ class Sessao {
     for (const e of lista) {
       if (this.extensoes.has(e.id)) continue;
       const r = await this.enviar('Page.addScriptToEvaluateOnNewDocument', { source: e.fonte });
-      if (r && r.identifier) { this.extensoes.set(e.id, { identificador: r.identifier, tamanho: e.fonte.length, fonte: e.fonte }); mudou = true; }
+      // Guardo so a marca (hash) da fonte, nao a fonte: com seis paineis, uma copia de cada script
+      // por painel era alguns megabytes parados na memoria do processo principal.
+      if (r && r.identifier) { this.extensoes.set(e.id, { identificador: r.identifier, marca: e.marca }); mudou = true; }
     }
     return mudou;
   }

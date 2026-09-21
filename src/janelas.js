@@ -43,8 +43,10 @@ function chamarWindows(cmd) {
     const p = subirPowerShell();
     if (!p) return resolve({ ok: false, erro: 'sem powershell' });
     const id = ++seq;
-    esperando.set(id, resolve);
-    setTimeout(() => { if (esperando.delete(id)) resolve({ ok: false, erro: 'sem resposta' }); }, 6000);
+    // O relogio de desistencia e desarmado quando a resposta chega: senao cada comando deixava um
+    // temporizador de 6 s vivo segurando o fechamento, e a ponte e chamada o tempo todo.
+    const relogio = setTimeout(() => { if (esperando.delete(id)) resolve({ ok: false, erro: 'sem resposta' }); }, 6000);
+    esperando.set(id, (r) => { clearTimeout(relogio); resolve(r); });
     p.stdin.write(JSON.stringify({ id, ...cmd }) + '\n');
   });
 }
@@ -77,15 +79,15 @@ async function chamarLinux(c) {
       await rodar('xdotool', ['windowreparent', c.alca, c.pai]);
       await rodar('xdotool', ['windowmove', c.alca, String(c.x), String(c.y)]);
       await rodar('xdotool', ['windowsize', c.alca, String(c.w), String(c.h)]);
-      await rodar('xdotool', ['windowmap', c.alca]);
+      await rodar('xdotool', [c.visivel === false ? 'windowunmap' : 'windowmap', c.alca]);
       return { ok: true };
-    case 'mover':
-      await rodar('xdotool', ['windowmove', c.alca, String(c.x), String(c.y)]);
-      await rodar('xdotool', ['windowsize', c.alca, String(c.w), String(c.h)]);
-      if (c.frente) await rodar('xdotool', ['windowraise', c.alca]);
-      return { ok: true };
-    case 'mover-lote': // todo painel e levantado em todo layout; o da frente vem por ultimo
-      for (const it of c.itens) await chamarLinux({ cmd: 'mover', ...it, frente: true });
+    case 'mover-lote': // mesma regra do Windows: levanta quem o app mandou levantar, esconde quem nao deve aparecer
+      for (const it of c.itens) {
+        await rodar('xdotool', ['windowmove', it.alca, String(it.x), String(it.y)]);
+        await rodar('xdotool', ['windowsize', it.alca, String(it.w), String(it.h)]);
+        if (it.levantar !== false) await rodar('xdotool', ['windowraise', it.alca]);
+        await rodar('xdotool', [it.visivel === false ? 'windowunmap' : 'windowmap', it.alca]);
+      }
       return { ok: true };
     case 'focar': await rodar('xdotool', ['windowfocus', c.alca]); return { ok: true };
     case 'foco-atual': { const r = await rodar('xdotool', ['getwindowfocus']); return { ok: true, alca: (r.saida || '').trim() }; }
@@ -99,16 +101,26 @@ async function chamarLinux(c) {
       await rodar('xdotool', ['windowsize', c.alca, String(c.w || 900), String(c.h || 700)]);
       return { ok: true };
     }
-    case 'acordar': await rodar('xdotool', ['windowmap', c.alca]); return { ok: true };
-    case 'reativar': await rodar('xdotool', ['windowfocus', c.alca]); return { ok: true };
-    case 'reencaixar':
-      await rodar('xdotool', ['windowreparent', c.alca, c.pai]);
-      await rodar('xdotool', ['windowsize', c.alca, String(c.w - 8), String(c.h - 8)]);
-      await rodar('xdotool', ['windowmove', c.alca, String(c.x), String(c.y)]);
-      await rodar('xdotool', ['windowsize', c.alca, String(c.w), String(c.h)]);
-      await rodar('xdotool', ['windowmap', c.alca]);
-      return { ok: true };
-    case 'recorte': return { ok: true }; // no X11 dos testes nao existe a barra do Chrome para recortar
+    case 'reencaixar': {
+      // Mesma regra do Windows: a danca completa so quando a janela esta fora do lugar (tamanho ou
+      // visibilidade); painel no lugar no maximo e levantado.
+      const g = await rodar('xdotool', ['getwindowgeometry', c.alca]);
+      const m = /Geometry:\s*(\d+)x(\d+)/.exec(g.saida || '');
+      const mapa = await rodar('xwininfo', ['-id', c.alca]);
+      const visivelAgora = /Map State:\s*IsViewable/.test(mapa.saida || '');
+      const querVisivel = c.visivel !== false;
+      const noLugar = !!m && Math.abs(Number(m[1]) - c.w) <= 2 && Math.abs(Number(m[2]) - c.h) <= 2 && visivelAgora === querVisivel;
+      const completo = !noLugar;
+      if (completo) {
+        await rodar('xdotool', ['windowreparent', c.alca, c.pai]);
+        await rodar('xdotool', ['windowsize', c.alca, String(c.w - 8), String(c.h - 8)]);
+        await rodar('xdotool', ['windowmove', c.alca, String(c.x), String(c.y)]);
+        await rodar('xdotool', ['windowsize', c.alca, String(c.w), String(c.h)]);
+        await rodar('xdotool', [querVisivel ? 'windowmap' : 'windowunmap', c.alca]);
+      }
+      if (c.levantar !== false) await rodar('xdotool', ['windowraise', c.alca]);
+      return { ok: true, completo, noLugar: true };
+    }
     case 'fechar': await rodar('xdotool', ['windowkill', c.alca]); return { ok: true };
     default: return { ok: false, erro: 'comando desconhecido' };
   }
@@ -117,18 +129,14 @@ async function chamarLinux(c) {
 const chamar = (cmd) => (ehWindows ? chamarWindows(cmd) : chamarLinux(cmd));
 
 module.exports = {
-  disponivel: () => ehWindows || process.platform === 'linux',
-  achar: (perfil, pids) => chamar({ cmd: 'achar', perfil, pids }),
+  // pid: o processo que o app mesmo lancou. No Windows e o caminho rapido (sem consulta WMI).
+  achar: (perfil, pids, pid) => chamar({ cmd: 'achar', perfil, pids, pid: pid || 0 }),
   encaixar: (alca, pai, cx) => chamar({ cmd: 'encaixar', alca, pai, ...cx }),
-  mover: (alca, cx, frente) => chamar({ cmd: 'mover', alca, ...cx, frente: !!frente }),
   // O pai vai junto porque no Windows dar teclado a uma janela de outro processo exige emparelhar
   // a fila de entrada das duas; so o handle da filha nao basta.
   focar: (alca, pai) => chamar({ cmd: 'focar', alca, pai }),
-  acordar: (alca) => chamar({ cmd: 'acordar', alca }),
-  reativar: (alca, pai) => chamar({ cmd: 'reativar', alca, pai }),
   reencaixar: (alca, pai, cx) => chamar({ cmd: 'reencaixar', alca, pai, ...cx }),
   soltar: (alca, cx) => chamar({ cmd: 'soltar', alca, ...(cx || {}) }),
-  recorte: (alca, topo, w, h) => chamar({ cmd: 'recorte', alca, topo, w, h }),
   moverLote: (itens, pai) => chamar({ cmd: 'mover-lote', itens, pai }),
   fechar: (alca, pai) => chamar({ cmd: 'fechar', alca, pai }),
   quemTemFoco: (pai) => chamar({ cmd: 'foco-atual', pai }),

@@ -81,6 +81,15 @@ function carregarConfig() {
 }
 const salvarConfig = () => { try { fs.writeFileSync(arqConfig(), JSON.stringify(config, null, 2)); } catch (_) {} };
 
+// Endereco de painel so pode ser pagina da web. Vazio continua valendo (painel segue o endereco
+// geral do app). Sem isso daria para salvar um file:// ou javascript: na configuracao, que depois
+// viraria o --app= do navegador e o alvo do botao "ir para o login".
+function urlDePagina(valor) {
+  const t = String(valor == null ? '' : valor).trim();
+  if (!t) return '';
+  try { return ['http:', 'https:'].includes(new URL(t).protocol) ? t : ''; } catch (_) { return ''; }
+}
+
 function acharChrome() {
   if (process.env.QV_CHROME && fs.existsSync(process.env.QV_CHROME)) return process.env.QV_CHROME;
   if (config && config.navegador && fs.existsSync(config.navegador)) return config.navegador;
@@ -176,12 +185,21 @@ function comRecorte(px) {
   const r = recorteEmPixels();
   return { x: px.x, y: px.y - r, w: px.w, h: px.h + r, recorte: r };
 }
+// Nos modos em que os paineis se sobrepoem (abas, ou um maximizado sobre a grade), levantar os de
+// tras a cada layout os traz por um instante para a frente do que esta visivel: o painel da frente e
+// coberto e descoberto, e isso e uma piscada a cada ronda. Ali so o da frente e levantado; os outros
+// ja estao atras dele e nao recebem clique nenhum. Na grade ninguem se sobrepoe, e todos sobem
+// (a janela invisivel do app volta por cima deles depois de minimizar ou redimensionar).
+const sobrepostos = () => ehAbas() || maximizado !== null;
+const deveLevantar = (frente) => frente || !sobrepostos();
+// Aba extra nao mora na grade: fora do modo abas ela fica escondida de verdade (ShowWindow), e nao
+// so empurrada para uma terceira linha fora da area. Empurrada, a barra de titulo dela ainda
+// espiava pelos ultimos pixels do app sempre que o Chrome zerava o recorte.
+const deveAparecer = (p) => !(p.extra && !ehAbas());
 function itemDeLayout(p, retangulo, frente) {
   const alvo = comRecorte(emPixels(retangulo));
-  const mudouTamanho = !p.ultimoTamanho || p.ultimoTamanho.w !== alvo.w || p.ultimoTamanho.h !== alvo.h;
-  p.ultimoTamanho = { w: alvo.w, h: alvo.h };
-  p.ultimaPos = { x: alvo.x, y: alvo.y };
-  return { alca: p.alca, x: alvo.x, y: alvo.y, w: alvo.w, h: alvo.h, recorte: alvo.recorte, frente, mudouTamanho };
+  return { alca: p.alca, x: alvo.x, y: alvo.y, w: alvo.w, h: alvo.h, recorte: alvo.recorte, frente,
+    levantar: deveLevantar(frente), visivel: deveAparecer(p) };
 }
 
 let alcaPai = null;
@@ -303,18 +321,31 @@ async function abrirPainel(i) {
   if (config.argsExtras) args.push(...String(config.argsExtras).split(' ').filter(Boolean));
   if (process.env.QV_CHROME_ARGS) args.push(...process.env.QV_CHROME_ARGS.split(' ').filter(Boolean));
   p.proc = spawn(chrome, args, { stdio: 'ignore' });
+  // Navegador fechado por fora (a pessoa clicou no X do Chrome, ou ele caiu) nunca devolvia a porta
+  // de depuracao reservada. Numa sessao longa, abrir e fechar paineis ia consumindo a faixa de
+  // portas a toa. O painel em si nao e derrubado aqui de proposito: sem ponte ele ja aparece como
+  // "ligando o controle do navegador..." com o botao de reabrir.
+  const portaDeste = p.portaDebug;   // a do processo QUE ESTA SAINDO: o painel pode ja ter outra
+  p.proc.on('error', () => {});   // spawn que falha nao pode virar excecao sem dono no processo principal
+  p.proc.on('exit', () => { if (p.portaDebug !== portaDeste) return; usadas.delete(portaDeste); });
   p.perfilDir = perfil;
   prepararPonte(p);
 
   // A janela do Chrome demora um pouco para existir; procuro ate achar.
-  const limite = Date.now() + 25000;
+  const inicio = Date.now();
+  const limite = inicio + 25000;
   while (Date.now() < limite) {
-    await new Promise((r) => setTimeout(r, 200)); // quanto antes eu achar, menos tempo ela fica solta na tela
+    // Quanto antes eu achar, menos tempo ela fica solta na tela e na barra de tarefas. Enquanto
+    // a busca e pelo processo (barata), pergunto a cada 100 ms.
+    const rapido = Date.now() - inicio < 8000 && !!p.proc;
+    await new Promise((r) => setTimeout(r, rapido ? 100 : 200));
     if (!p.abrindo) return; // cancelado
-    const r = await janelas.achar(perfil, pidsDoPerfil(perfil));
+    // Primeiro pelo processo lancado (rapido). Se em 8 s a janela nao apareceu nele, volto a
+    // procurar pelo perfil, que cobre navegador lancado por um processo intermediario.
+    const r = await janelas.achar(perfil, pidsDoPerfil(perfil), rapido ? p.proc.pid : 0);
     if (r.ok && r.alca) {
       p.alca = r.alca;
-      const enc = await janelas.encaixar(p.alca, handleDaJanela(), comRecorte(emPixels(corpo(celulas()[i].celula))));
+      const enc = await janelas.encaixar(p.alca, handleDaJanela(), { ...comRecorte(emPixels(corpo(celulas()[i].celula))), visivel: deveAparecer(p) });
       if (!enc.ok) { p.erro = `não consegui encaixar (${enc.erro || 'erro'})`; p.solto = true; }
       p.abrindo = false;
       await posicionar();
@@ -358,11 +389,11 @@ async function encaixarDeVolta(i) {
   const p = paineis[i];
   if (!p.solto) return;
   if (!p.alca) { // encaixe falhou antes: procuro a janela de novo
-    const r = await janelas.achar(p.perfilDir, pidsDoPerfil(p.perfilDir || ''));
+    const r = await janelas.achar(p.perfilDir, pidsDoPerfil(p.perfilDir || ''), p.proc && p.proc.pid);
     if (!r.ok) { p.erro = `não achei a janela (${r.erro || 'erro'})`; empurrar(); return; }
     p.alca = r.alca;
   }
-  const r = await janelas.encaixar(p.alca, handleDaJanela(), comRecorte(emPixels(corpo(celulas()[i].celula))));
+  const r = await janelas.encaixar(p.alca, handleDaJanela(), { ...comRecorte(emPixels(corpo(celulas()[i].celula))), visivel: deveAparecer(p) });
   if (r.ok) { p.solto = false; p.soltoPorFalha = false; p.erro = ''; }
   else p.erro = `não consegui encaixar de volta (${r.erro || 'erro'})`;
   await posicionar();
@@ -383,7 +414,13 @@ function pegarCreds(slug) {
   try { return { user: c.user, pass: safeStorage.decryptString(Buffer.from(c.pass, 'base64')) }; } catch (_) { return null; }
 }
 const temCreds = (slug) => { const c = lerCreds()[slug]; return !!(c && c.user && c.pass); };
-const daCasca = (e) => !!e.senderFrame && e.senderFrame.url.startsWith('file://'); // o jogo nao tem IPC nenhum
+// Todo canal de IPC confere que quem mandou e uma janela do proprio app (arquivo local). O jogo roda
+// num navegador de verdade e nao tem IPC nenhum, entao isso e cinto de seguranca: vale para o dia em
+// que alguma janela do app carregar conteudo que nao seja nosso.
+const daCasca = (e) => !!e.senderFrame && e.senderFrame.url.startsWith('file://');
+// Indice de painel vindo da casca. Fora da faixa, um `paineis[i].algo` estoura no processo principal
+// e derruba o app inteiro; aqui a acao so e descartada.
+const painelValido = (i) => Number.isInteger(i) && i >= 0 && i < paineis.length;
 
 function janelaDeConfig() {
   if (janelaDeConfig.aberta && !janelaDeConfig.aberta.isDestroyed()) { janelaDeConfig.aberta.focus(); return; }
@@ -527,13 +564,21 @@ async function lerEstado(p) {
   else if (p.alerta && (p.alerta.startsWith('Login preenchido') || p.alerta.startsWith('Cliquei'))) p.alerta = '';
 }
 
+// A ronda e assincrona e o relogio nao espera: painel lento (a leitura de estado espera ate 8 s)
+// fazia a ronda seguinte comecar por cima da anterior, e duas rondas juntas reinjetam o observador
+// e disputam a mesma sessao. Uma de cada vez.
+let emRonda = false;
 async function rondaDeEstado() {
-  for (const p of paineis) {
-    if (!p.alca && !p.proc) continue;
-    if (!temPonte(p)) { await ligarPonte(p); continue; }
-    await lerEstado(p);
-  }
-  empurrar();
+  if (emRonda) return;
+  emRonda = true;
+  try {
+    for (const p of paineis) {
+      if (!p.alca && !p.proc) continue;
+      if (!temPonte(p)) { await ligarPonte(p); continue; }
+      await lerEstado(p);
+    }
+    empurrar();
+  } finally { emRonda = false; }
 }
 
 const recarregar = (i, semCache) => {
@@ -580,17 +625,21 @@ function diagnostico(p) {
 }
 
 let tentativasDeEncaixe = 0;
+let emRondaDeJanelas = false;
 async function rondaDeJanelas() {
-  if (!win || win.isDestroyed() || win.isMinimized()) return;
-  // Reposicionar de novo conserta painel que saiu do lugar sozinho (janela que o navegador
-  // redimensionou por conta propria, por exemplo).
-  await posicionar();
-  // Encaixe que falhou tenta de novo, sem insistir pra sempre.
-  const falhos = paineis.filter((p) => p.solto && p.soltoPorFalha && p.alca);
-  if (falhos.length && tentativasDeEncaixe < 6) {
-    tentativasDeEncaixe++;
-    for (const p of falhos) await encaixarDeVolta(p.i);
-  }
+  if (emRondaDeJanelas || !win || win.isDestroyed() || win.isMinimized()) return;
+  emRondaDeJanelas = true;
+  try {
+    // Reposicionar de novo conserta painel que saiu do lugar sozinho (janela que o navegador
+    // redimensionou por conta propria, por exemplo).
+    await posicionar();
+    // Encaixe que falhou tenta de novo, sem insistir pra sempre.
+    const falhos = paineis.filter((p) => p.solto && p.soltoPorFalha && p.alca);
+    if (falhos.length && tentativasDeEncaixe < 6) {
+      tentativasDeEncaixe++;
+      for (const p of falhos) await encaixarDeVolta(p.i);
+    }
+  } finally { emRondaDeJanelas = false; }
 }
 
 function vigiar() {
@@ -666,6 +715,12 @@ function criarJanela() {
   // paineis nessa hora nao tem efeito nenhum (era por isso que as correcoes anteriores nao pegavam,
   // enquanto trocar de aba, que acontece depois, funcionava). Entao refaço o encaixe com atraso,
   // duas vezes, e o segundo passe cobre maquina lenta.
+  // Cada volta tinha ate seis passes (restore, show e focus disparam juntos), e cada passe
+  // reencaixava os quatro paineis com redimensionamento e repintura forcada. Redimensionar uma
+  // janela do Chrome faz o compositor dele refazer a superficie: e um quadro em branco por
+  // painel, a "piscada". Agora a volta so confere (pai, posicao, tamanho, visivel) e levanta;
+  // a danca completa fica para painel que estiver de fato fora do lugar. O congelamento que a
+  // danca curava e resolvido pela flag CalculateNativeWinOcclusion desligada no navegador.
   let acordando = false;
   async function acordarPaineis() {
     if (acordando || !win || win.isDestroyed() || win.isMinimized()) return;
@@ -674,16 +729,28 @@ function criarJanela() {
       const cs = celulas();
       const daFrente = ehAbas() ? abaAtiva : maximizado;
       const ordem = paineis.filter((p) => p.alca && !p.solto).sort((a, b) => (a.i === daFrente) - (b.i === daFrente));
+      let todosNoLugar = ordem.length > 0;
+      let completos = 0;
       for (const p of ordem) { // o painel da frente por ultimo, pra terminar por cima e com o foco
         const c = cs[p.i];
+        const frente = p.i === daFrente;
         const alvo = ehAbas() || maximizado === null || maximizado === p.i ? c.celula : c.grade;
-        await janelas.reencaixar(p.alca, handleDaJanela(), comRecorte(emPixels(corpo(alvo))));
+        const r = await janelas.reencaixar(p.alca, handleDaJanela(), { ...comRecorte(emPixels(corpo(alvo))), levantar: deveLevantar(frente), visivel: deveAparecer(p) });
+        if (!r || !r.ok || r.noLugar === false) todosNoLugar = false;
+        if (r && r.completo) completos++;
       }
+      if (process.env.QV_TEST) console.log('QVVOLTA ' + JSON.stringify({ paineis: ordem.length, todosNoLugar, completos }));
       await posicionar();
       await garantirTeclado(); // volta do minimizado tem de voltar com teclado tambem
     } finally { acordando = false; }
   }
-  const aoVoltar = () => { setTimeout(acordarPaineis, 250); setTimeout(acordarPaineis, 1100); };
+  let voltaTimers = [];
+  const aoVoltar = () => {
+    // restore e show chegam juntos: uma agenda so, nao duas.
+    voltaTimers.forEach(clearTimeout);
+    clearTimeout(debounce); clearTimeout(debounce2); // acordar ja posiciona; o passe do focus seria repetido
+    voltaTimers = [setTimeout(acordarPaineis, 250), setTimeout(acordarPaineis, 1100)];
+  };
   win.on('restore', aoVoltar);
   win.on('show', aoVoltar);
   win.on('resize', reposicionar);
@@ -693,7 +760,14 @@ function criarJanela() {
   win.on('closed', () => { win = null; app.quit(); });
 }
 
+// Acoes que mexem num painel especifico: sem um indice valido elas estourariam no processo
+// principal (paineis[i] indefinido) e derrubariam o app.
+const ACOES_COM_PAINEL = new Set(['abrir', 'fechar', 'maximizar', 'aba', 'foco', 'destacar', 'encaixar',
+  'recarregar', 'som', 'ir-login', 'acesso', 'preencher', 'reabrir', 'falha-teste', 'navegar-teste',
+  'metodo-painel-teste', 'creds-teste']);
+
 function executarAcao({ acao, i, valor }) {
+  if (ACOES_COM_PAINEL.has(acao) && !painelValido(i)) return;
   switch (acao) {
     case 'abrir': abrirPainel(i); break;
     case 'fechar': fecharPainel(i); break;
@@ -752,14 +826,16 @@ function executarAcao({ acao, i, valor }) {
   }
   empurrar();
 }
-ipcMain.on('acao', (_e, d) => executarAcao(d));
-ipcMain.handle('config:ler', () => ({ ...config, navegadorEmUso: acharChrome() || '' }));
-ipcMain.handle('config:salvar', (_e, novo) => {
+ipcMain.on('acao', (e, d) => { if (daCasca(e)) executarAcao(d || {}); });
+ipcMain.handle('config:ler', (e) => (daCasca(e) ? { ...config, navegadorEmUso: acharChrome() || '' } : null));
+ipcMain.handle('config:salvar', (e, novo) => {
+  if (!daCasca(e) || !novo || typeof novo !== 'object') return false;
   config = { ...config, ...novo };
+  config.url = urlDePagina(novo.url) || config.url || PADRAO.url;
   config.extras = (config.extras || []).map((p, i) => ({
     nome: String(p.nome || `Extra ${i + 1}`).slice(0, 24),
     slug: String(p.slug || `extra-${i + 1}`).replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
-    url: String(p.url || ''),
+    url: urlDePagina(p.url),
   })).filter((p) => p.url).slice(0, 4);
   config.navegador = String(novo.navegador != null ? novo.navegador : config.navegador || '');
   config.argsExtras = String(novo.argsExtras != null ? novo.argsExtras : config.argsExtras || '');
@@ -768,14 +844,14 @@ ipcMain.handle('config:salvar', (_e, novo) => {
   config.perfis = config.perfis.slice(0, 4).map((p, i) => {
     const slug = String(p.slug || `conta-${i + 1}`).replace(/[^a-z0-9-]/gi, '-').toLowerCase();
     const metodo = METODOS.includes(p.metodoLogin) ? p.metodoLogin : (metodosAntes[slug] || '');
-    return { nome: String(p.nome || `Conta ${i + 1}`).slice(0, 24), slug, url: String(p.url || ''), metodoLogin: metodo };
+    return { nome: String(p.nome || `Conta ${i + 1}`).slice(0, 24), slug, url: urlDePagina(p.url), metodoLogin: metodo };
   });
   salvarConfig();
   montarPaineis();
   posicionar();
   return true;
 });
-ipcMain.on('abrir-pasta', () => shell.openPath(pastaPerfis()));
+ipcMain.on('abrir-pasta', (e) => { if (daCasca(e)) shell.openPath(pastaPerfis()); });
 ipcMain.handle('ext:listar', (e) => (daCasca(e) ? extensoes.listar() : []));
 ipcMain.handle('ext:ativar', async (e, { id, ativa }) => {
   if (!daCasca(e)) return { ok: false };
@@ -793,7 +869,7 @@ ipcMain.on('ext:pagina', (e, id) => {
   const item = daCasca(e) && extensoes.CATALOGO.find((c) => c.id === id);
   if (item) shell.openExternal(item.pagina); // so endereco do catalogo, nunca o que vier da janela
 });
-ipcMain.handle('creds:ler', (e, i) => !daCasca(e) ? null : ({
+ipcMain.handle('creds:ler', (e, i) => (!daCasca(e) || !painelValido(i)) ? null : ({
   metodo: ((config.perfis || []).find((x) => x.slug === paineis[i].slug) || {}).metodoLogin || '',
   metodoPadrao: metodoPadrao(),
   user: (lerCreds()[paineis[i].slug] || {}).user || '',
@@ -808,8 +884,8 @@ function definirMetodo(i, metodo) {
   salvarConfig();
 }
 
-ipcMain.handle('creds:salvar', (e, { i, user, pass, metodo }) => {
-  if (!daCasca(e) || !paineis[i]) return false;
+ipcMain.handle('creds:salvar', (e, { i, user, pass, metodo } = {}) => {
+  if (!daCasca(e) || !painelValido(i)) return false;
   if (metodo !== undefined) definirMetodo(i, metodo);
   // Google ou "nao fazer nada" nao precisam de usuario e senha guardados.
   if (!user && !pass) { empurrar(); preencherLogin(paineis[i], false); return true; }
@@ -826,7 +902,7 @@ ipcMain.handle('creds:salvar', (e, { i, user, pass, metodo }) => {
   return true;
 });
 ipcMain.handle('creds:limpar', (e, i) => {
-  if (!daCasca(e)) return false;
+  if (!daCasca(e) || !painelValido(i)) return false;
   const todos = lerCreds();
   delete todos[paineis[i].slug];
   gravarCreds(todos);
@@ -845,7 +921,7 @@ function montarPaineis() {
     const velho = antes.find((p) => p.slug === perfil.slug);
     paineis.push(velho ? Object.assign(velho, { i, nome: perfil.nome, url: perfil.url, extra: perfil.extra })
       : { i, nome: perfil.nome, slug: perfil.slug, url: perfil.url, extra: perfil.extra,
-          alca: null, ws: null, estado: null, mudo: false, tentativas: 0 });
+          alca: null, estado: null, mudo: false, tentativas: 0 });
   });
   if (abaAtiva >= paineis.length) abaAtiva = 0;
   antes.filter((p) => !paineis.includes(p)).forEach((p) => fecharPainel(p.i));

@@ -3,10 +3,22 @@
 const fs = require('fs');
 const path = require('path');
 const ps = fs.readFileSync(path.join(__dirname, '..', 'src', 'win32.ps1'), 'utf8');
-const lote = ps.slice(ps.indexOf("'mover-lote'"), ps.indexOf("'mover' {"));
 const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
 const casca = fs.readFileSync(path.join(__dirname, '..', 'src', 'casca.js'), 'utf8');
 const jan = fs.readFileSync(path.join(__dirname, '..', 'src', 'janelas.js'), 'utf8');
+
+// Corta o bloco de um comando do win32.ps1. Antes cada corte terminava no NOME do comando seguinte,
+// entao remover um comando quebrava guardas que nao tinham nada a ver com ele. Aqui o fim e "o
+// proximo comando, seja qual for".
+function comando(nome) {
+  const ini = ps.indexOf(`      '${nome}' {`);
+  if (ini < 0) return '';
+  const resto = ps.slice(ini + 1);
+  const fim = resto.search(/\n {6}'[a-z-]+' \{/);
+  return fim < 0 ? resto : resto.slice(0, fim);
+}
+const comandosDoPs = [...ps.matchAll(/^ {6}'([a-z-]+)' \{/gm)].map((m) => m[1]);
+const lote = comando('mover-lote');
 const checagens = [
   ['desliga a detecção de janela encoberta (painel congelava ao minimizar)', /CalculateNativeWinOcclusion/.test(main)],
   ['refaz o encaixe quando o app volta do minimizado', /win\.on\('restore', aoVoltar\)/.test(main)],
@@ -15,13 +27,57 @@ const checagens = [
     && /win\.isMinimized\(\)\) return/.test(main)],
   ['o reencaixe faz um redimensionamento de verdade, como trocar de aba',
     /'reencaixar'/.test(ps) && /\$c\.w - 8/.test(ps)],
-  ['o comando de acordar redesenha a janela', /'acordar'/.test(ps) && /RedrawWindow/.test(ps)],
-  ['acordar levanta o painel (senão o app engole os cliques)', (() => {
-    const bloco = ps.slice(ps.indexOf("'acordar'"), ps.indexOf("'focar' {"));
+  // Isto morava num comando "acordar" proprio, que virou peso morto quando o reencaixe passou a
+  // fazer o mesmo. As duas garantias continuam valendo, agora dentro do reencaixe.
+  ['o reencaixe redesenha a janela que estava escondida', /RedrawWindow/.test(comando('reencaixar'))],
+  ['o reencaixe levanta o painel (senão o app engole os cliques)', (() => {
+    const bloco = comando('reencaixar');
     return /SetWindowPos/.test(bloco) && !/SWP_NOZORDER/.test(bloco);
   })()],
   ['escolhe a maior janela do perfil, não a primeira', /MaiorJanelaDe/.test(ps) && !/JanelasDe\(/.test(ps)],
-  ['o recorte é reaplicado a cada layout', !/mudouTamanho/.test(ps.slice(ps.indexOf("'mover-lote'"), ps.indexOf("'mover' {")))],
+  // O Chrome zera a regiao da propria janela quando ela muda de tamanho. Lembrar "ja apliquei"
+  // deixou as abas extras espiando embaixo do app; a unica fonte confiavel e a propria janela.
+  ['o recorte é conferido na janela (GetWindowRgn) a cada layout, e reaplicado se o Chrome zerou',
+    /Recortar \$h/.test(lote) && /GetWindowRgn/.test(ps) && /TemRecorte\(\$h/.test(ps) && !/\$regioes/.test(ps)],
+  // Piscadas: SetWindowRgn com redraw invalida a janela inteira mesmo com regiao igual, e o app
+  // recortava os quatro paineis em toda ronda e em toda volta do minimizado.
+  ['não recorta de novo o que já está recortado igual', /if \(\[QV\]::TemRecorte\(\$h, \$recorte, \$w, \$ht\)\) \{ return \$false \}/.test(ps)
+    && !/CreateRectRgn/.test(lote)],
+  ['reencaixar só faz a dança completa quando o painel está fora do lugar', (() => {
+    const bloco = comando('reencaixar');
+    return /\$completo = -not \[QV\]::NoLugar\(/.test(bloco) && !/forcar/.test(bloco) && !/acordouForte|QV_ACORDAR/.test(main)
+      && /if \(\$completo -and \$visivel\) \{[\s\S]*RedrawWindow/.test(bloco);
+  })()],
+  ['o tamanho intermediário do reencaixe não é pintado', /\$c\.w - 8, \[int\]\$c\.h - 8, \$false\)/.test(ps)],
+  ['restore e show viram uma agenda só na volta do minimizado', /voltaTimers\.forEach\(clearTimeout\)/.test(main)],
+  // Modo abas piscava e a grade nao: com paineis sobrepostos, levantar os de tras a cada layout
+  // cobre e descobre o da frente.
+  ['com painéis sobrepostos (abas ou maximizado) só o da frente é levantado', (() => {
+    const bloco = comando('reencaixar');
+    return /const sobrepostos = \(\) => ehAbas\(\) \|\| maximizado !== null/.test(main)
+      && /const deveLevantar = \(frente\) => frente \|\| !sobrepostos\(\)/.test(main)
+      && /if \(\$it\.levantar -eq \$false\) \{ \$flags = \$flags -bor \$SWP_NOZORDER \}/.test(lote)
+      && /if \(\$c\.levantar -ne \$false\) \{[\s\S]*SetWindowPos/.test(bloco);
+  })()],
+  ['aba extra fora do modo abas fica escondida de verdade, não só fora da área', (() => {
+    return /const deveAparecer = \(p\) => !\(p\.extra && !ehAbas\(\)\)/.test(main) && /visivel: deveAparecer\(p\)/.test(main)
+      && /Mostrar \$h \(\$it\.visivel -ne \$false\)/.test(lote) && /IsWindowVisible\(h\) != visivel\) return false/.test(ps);
+  })()],
+  // Janela solta na tela antes de encaixar: achar por WMI e lento e seis paineis disputavam a fila.
+  ['achar usa o processo lançado antes da consulta lenta por perfil', (() => {
+    const bloco = comando('achar');
+    return /GetProcessById/.test(bloco) && bloco.indexOf('MaiorJanelaDe($so') < bloco.indexOf('PidsDoPerfil $c.perfil')
+      && /p\.proc\.pid : 0\)/.test(main);
+  })()],
+  // Comando implementado e nunca chamado e peso morto que ninguem percebe: foi assim que 'mover',
+  // 'recorte', 'acordar' e 'reativar' sobreviveram depois de o reencaixe assumir o trabalho deles.
+  ['todo comando do win32.ps1 tem quem o chame em janelas.js',
+    comandosDoPs.length > 0 && comandosDoPs.every((n) => jan.includes(`cmd: '${n}'`))],
+  ['toda função exportada por janelas.js é usada no main.js', (() => {
+    const bloco = jan.slice(jan.indexOf('module.exports'));
+    const exportadas = [...bloco.matchAll(/^ {2}([a-zA-Z]+):/gm)].map((m) => m[1]);
+    return exportadas.length > 0 && exportadas.every((f) => new RegExp(`janelas\\.${f}\\b`).test(main));
+  })()],
   ['o observador injetado mora em arquivo próprio, fora de string',
     fs.existsSync(path.join(__dirname, '..', 'src', 'observador.js'))],
   ['emparelha a fila de entrada ao voltar do minimizado (AttachThreadInput)',
@@ -30,8 +86,9 @@ const checagens = [
   ['confere o retângulo que a janela realmente ficou', /RetanguloNoPai/.test(ps) && /foraDoLugar/.test(main)],
   ['existe ronda que conserta janela fora do lugar', /rondaDeJanelas/.test(main) && /setInterval\(rondaDeJanelas/.test(main)],
   ['não manda painel para o fundo (HWND_BOTTOM)', !/\[IntPtr\]1\b/.test(lote)],
-  ['todo painel é levantado em todo layout (a janela invisível do app volta pra cima e come os cliques)',
-    /HWND_TOP/.test(lote) && !/SWP_NOZORDER/.test(lote)],
+  ['painel que não se sobrepõe é levantado em todo layout (a janela invisível do app volta pra cima e come os cliques)',
+    /HWND_TOP/.test(lote) && (lote.match(/SWP_NOZORDER/g) || []).length === 2 // a constante e o unico uso, condicionado a levantar=false
+    && /\$flags = \$SWP_NOACTIVATE\n/.test(lote)],
   ['o painel da frente vai por último e termina por cima', /itens\.sort\(\(a, b\) => \(a\.frente \? 1 : 0\)/.test(main)],
   ['há segundo passe atrasado depois de redimensionar, maximizar e focar',
     /debounce2 = setTimeout\(posicionar, 500\)/.test(main) && /win\.on\('focus', \(\) => \{ reposicionar\(\)/.test(main)],
@@ -93,7 +150,10 @@ const checagens = [
   ['o foco vai junto com o handle do pai (só o da filha não atravessa processo)',
     /focar: \(alca, pai\)/.test(jan) && /janelas\.focar\(p\.alca, handleDaJanela\(\)\)/.test(main)],
   ['esconde a janela antes de encaixar', /ShowWindow\(\$h, \$SW_HIDE\)/.test(ps)],
-  ['mostra a janela só depois de posicionada', ps.indexOf('SW_HIDE') < ps.indexOf('$SW_SHOW)   # so aparece')],
+  ['mostra a janela só depois de posicionada', (() => {
+    const bloco = ps.slice(ps.indexOf("'encaixar' {"), ps.indexOf("'mover-lote' {"));
+    return bloco.indexOf('$SW_HIDE') >= 0 && bloco.indexOf('$SW_HIDE') < bloco.indexOf('# so aparece');
+  })()],
 ];
 let falhou = false;
 for (const [nome, ok] of checagens) { console.log(`${ok ? 'PASSOU' : 'FALHOU'}  ${nome}`); if (!ok) falhou = true; }

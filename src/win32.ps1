@@ -147,6 +147,9 @@ public class QV {
     bool antes = false;
     while (true) {
       Thread.Sleep(25);
+      // Sem painel encaixado nao ha clique para vigiar. A thread sai, e o proximo encaixe a levanta
+      // de novo: com todos os paineis fechados o app parava de acordar 40 vezes por segundo a toa.
+      lock (trava) { if (paineisVivos.Count == 0) { vigia = null; return; } }
       try {
         bool agora = (GetAsyncKeyState(1) & 0x8000) != 0 || (GetAsyncKeyState(2) & 0x8000) != 0;
         bool desceu = agora && !antes;
@@ -177,7 +180,30 @@ public class QV {
     if (pai != IntPtr.Zero) ScreenToClient(pai, ref canto);
     return new int[] { canto.X, canto.Y, r.Right - r.Left, r.Bottom - r.Top };
   }
+  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
+  // Ja esta encaixada, no lugar, no tamanho e com a visibilidade pedida? Quando sim, a volta do
+  // minimizado nao precisa da danca de reencaixe: cada repintura forcada e uma piscada no jogo.
+  public static bool NoLugar(IntPtr h, IntPtr pai, int x, int y, int w, int ht, bool visivel) {
+    if (!IsWindow(h) || IsWindowVisible(h) != visivel) return false;
+    if (GetParent(h) != pai) return false;
+    int[] r = RetanguloNoPai(h, pai);
+    return Math.Abs(r[0] - x) <= 2 && Math.Abs(r[1] - y) <= 2 && Math.Abs(r[2] - w) <= 2 && Math.Abs(r[3] - ht) <= 2;
+  }
   [DllImport("user32.dll")] public static extern int SetWindowRgn(IntPtr h, IntPtr rgn, bool redraw);
+  [DllImport("user32.dll")] static extern int GetWindowRgn(IntPtr h, IntPtr rgn);
+  [DllImport("gdi32.dll")] static extern int GetRgnBox(IntPtr rgn, out RECT r);
+  [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+  // O recorte que a janela tem AGORA e o pedido? O Chrome mexe na regiao da propria janela quando
+  // ela muda de tamanho (ele zera a nossa), entao nao da para lembrar o que foi aplicado: tem de
+  // perguntar. E perguntar e barato; reaplicar sem precisar e uma repintura inteira.
+  public static bool TemRecorte(IntPtr h, int topo, int w, int ht) {
+    IntPtr rgn = CreateRectRgn(0, 0, 0, 0);
+    try {
+      if (GetWindowRgn(h, rgn) != 2) return false;   // 2 = SIMPLEREGION; 0 = sem regiao
+      RECT r; if (GetRgnBox(rgn, out r) == 0) return false;
+      return r.Left == 0 && r.Top == topo && r.Right == w && r.Bottom == ht;
+    } finally { DeleteObject(rgn); }
+  }
   [DllImport("gdi32.dll")] public static extern IntPtr CreateRectRgn(int a, int b, int c, int d);
   [DllImport("user32.dll")] public static extern IntPtr BeginDeferWindowPos(int n);
   [DllImport("user32.dll")] public static extern IntPtr DeferWindowPos(IntPtr hdwp, IntPtr h, IntPtr after, int x, int y, int w, int ht, uint flags);
@@ -217,16 +243,11 @@ public class QV {
     return melhor;
   }
 
-  public static string Retangulo(IntPtr h) {
-    RECT r; if (!GetWindowRect(h, out r)) return "";
-    return (r.Right - r.Left) + "x" + (r.Bottom - r.Top);
-  }
 }
 "@
 
 $GWL_STYLE = -16
 $WS_CHILD = 0x40000000
-$WS_POPUP = -2147483648   # 0x80000000
 $WS_CAPTION = 0x00C00000
 $WS_THICKFRAME = 0x00040000
 $WS_MINIMIZEBOX = 0x00020000
@@ -238,6 +259,24 @@ $SW_HIDE = 0
 $WM_CLOSE = 0x0010
 
 function Responder($obj) { Write-Output ($obj | ConvertTo-Json -Compress) }
+
+# SetWindowRgn nao compara: com redraw ele invalida a janela INTEIRA toda vez, mesmo que a regiao
+# seja igual a que ja esta. Como todo layout (ronda de 10 s, foco, volta do minimizado) passava por
+# aqui, cada painel repintava do zero a toda hora. Agora so aplico quando a janela nao esta com o
+# recorte pedido. Nao vale guardar o que foi aplicado: o Chrome zera a regiao da janela quando ela
+# muda de tamanho (foi assim que as abas extras apareceram espiando embaixo do app).
+function Recortar([IntPtr]$h, [int]$recorte, [int]$w, [int]$ht, [bool]$redraw) {
+  if ([QV]::TemRecorte($h, $recorte, $w, $ht)) { return $false }
+  $rgn = [QV]::CreateRectRgn(0, $recorte, $w, $ht)
+  [void][QV]::SetWindowRgn($h, $rgn, $redraw)
+  return $true
+}
+# Painel que deve ficar escondido (aba extra fora do modo abas) e escondido de verdade, nao so
+# empurrado para fora da area: assim nada dele aparece, e o navegador nem gasta desenhando.
+function Mostrar([IntPtr]$h, [bool]$visivel) {
+  if ([QV]::IsWindowVisible($h) -eq $visivel) { return }
+  if ($visivel) { [void][QV]::ShowWindow($h, 8) } else { [void][QV]::ShowWindow($h, 0) }   # 8 = SW_SHOWNA, 0 = SW_HIDE
+}
 
 # Todos os processos do Chrome cujo comando aponta para a pasta deste perfil.
 function PidsDoPerfil([string]$perfil) {
@@ -257,19 +296,30 @@ while ($true) {
     $c = $linha | ConvertFrom-Json
     switch ($c.cmd) {
       'achar' {
-        $pids = PidsDoPerfil $c.perfil
-        if ($pids.Count -eq 0) { Responder @{ id = $c.id; ok = $false; erro = 'sem processo' }; break }
-        $j = [QV]::MaiorJanelaDe($pids, 300, 200)
+        # Caminho rapido: o processo que o app lancou e o processo principal do navegador, e a janela
+        # e dele. Sem isso cada tentativa era uma consulta WMI (lenta, e seis paineis consultando na
+        # mesma fila), e a janela ficava segundos solta na tela antes de ser encaixada.
+        $j = [IntPtr]::Zero
+        $vivo = $false
+        if ($c.pid -and [int64]$c.pid -gt 0) {
+          try { [void][System.Diagnostics.Process]::GetProcessById([int][int64]$c.pid); $vivo = $true } catch { $vivo = $false }
+          if ($vivo) {
+            $so = New-Object 'System.Collections.Generic.HashSet[uint32]'
+            [void]$so.Add([uint32][int64]$c.pid)
+            $j = [QV]::MaiorJanelaDe($so, 300, 200)
+            # Processo vivo e ainda sem janela: e cedo, nao e caso de consulta lenta.
+            if ($j -eq [IntPtr]::Zero) { Responder @{ id = $c.id; ok = $false; erro = 'sem janela' }; break }
+          }
+        }
+        if ($j -eq [IntPtr]::Zero) {
+          # Caminho lento: processo lancado ja encerrou porque um navegador aberto com este perfil
+          # assumiu a janela, ou nao veio pid. Ai a janela pertence a outro processo.
+          $pids = PidsDoPerfil $c.perfil
+          if ($pids.Count -eq 0) { Responder @{ id = $c.id; ok = $false; erro = 'sem processo' }; break }
+          $j = [QV]::MaiorJanelaDe($pids, 300, 200)
+        }
         if ($j -eq [IntPtr]::Zero) { Responder @{ id = $c.id; ok = $false; erro = 'sem janela' }; break }
         Responder @{ id = $c.id; ok = $true; alca = $j.ToInt64().ToString() }
-      }
-      'recorte' {
-        # A barra de titulo do Chrome e desenhada por ele dentro da janela, entao nao sai por estilo.
-        # A saida e limitar a regiao visivel da janela, escondendo as primeiras linhas.
-        $h = [IntPtr][int64]$c.alca
-        $rgn = [QV]::CreateRectRgn(0, [int]$c.topo, [int]$c.w, [int]$c.h)
-        [void][QV]::SetWindowRgn($h, $rgn, $true)
-        Responder @{ id = $c.id; ok = $true }
       }
       'encaixar' {
         $h = [IntPtr][int64]$c.alca
@@ -282,10 +332,9 @@ while ($true) {
         [void][QV]::SetParent($h, $pai)
         [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $false)
         if ($c.recorte -and [int]$c.recorte -gt 0) {
-          $rgn = [QV]::CreateRectRgn(0, [int]$c.recorte, [int]$c.w, [int]$c.h)
-          [void][QV]::SetWindowRgn($h, $rgn, $false)
+          [void](Recortar $h ([int]$c.recorte) ([int]$c.w) ([int]$c.h) $false)
         }
-        [void][QV]::ShowWindow($h, $SW_SHOW)   # so aparece ja encaixada e no lugar certo
+        if ($c.visivel -ne $false) { [void][QV]::ShowWindow($h, $SW_SHOW) }   # so aparece ja encaixada e no lugar certo
         # Fica grudado enquanto o painel estiver encaixado: e o que faz a tecla digitada chegar nele.
         [void][QV]::Grudar($h, $pai)
         Responder @{ id = $c.id; ok = $true }
@@ -303,12 +352,21 @@ while ($true) {
           # maximizada ou redimensionada. O painel segue visivel, mas o clique cai nela. Por isso TODO
           # painel e levantado em TODO layout (nunca rebaixado: isso o esconde). O da frente vem por
           # ultimo na lista e termina por cima.
-          $SWP_NOACTIVATE = 0x0010
+          # Excecao: quando os paineis se sobrepoem (modo abas, ou um maximizado sobre a grade),
+          # levantar os de tras os traz por um instante para a frente do visivel, e o da frente e
+          # coberto e descoberto a cada ronda: piscada. Nesses modos o app manda levantar=false para
+          # os de tras, que ja estao atras e nao recebem clique; so o da frente sobe.
+          $SWP_NOACTIVATE = 0x0010; $SWP_NOZORDER = 0x0004
           $flags = $SWP_NOACTIVATE
+          if ($it.levantar -eq $false) { $flags = $flags -bor $SWP_NOZORDER }
           $depois = [IntPtr]0                       # HWND_TOP
           $hdwp = [QV]::DeferWindowPos($hdwp, $h, $depois, [int]$it.x, [int]$it.y, [int]$it.w, [int]$it.h, $flags)
         }
         [void][QV]::EndDeferWindowPos($hdwp)
+        foreach ($it in $itens) {
+          $h = [IntPtr][int64]$it.alca
+          if ([QV]::IsWindow($h)) { Mostrar $h ($it.visivel -ne $false) }
+        }
         # Confiro o que a janela REALMENTE ficou. Ela nem sempre obedece de primeira, e sem conferir
         # o painel fica torto para sempre porque eu seguiria mandando a mesma coisa.
         $fora = @()
@@ -325,33 +383,15 @@ while ($true) {
             }
           }
         }
+        $recortados = 0
         foreach ($it in $itens) {
           if (-not ($it.recorte -and [int]$it.recorte -gt 0)) { continue }
           $h = [IntPtr][int64]$it.alca
-          $rgn = [QV]::CreateRectRgn(0, [int]$it.recorte, [int]$it.w, [int]$it.h)
-          [void][QV]::SetWindowRgn($h, $rgn, $true)
+          if (-not [QV]::IsWindow($h)) { continue }
+          # So recorta de novo quando a janela nao esta com o recorte pedido: senao e uma repintura inteira a toa.
+          if (Recortar $h ([int]$it.recorte) ([int]$it.w) ([int]$it.h) $true) { $recortados++ }
         }
-        Responder @{ id = $c.id; ok = $true; fora = $fora }
-      }
-      'mover' {
-        $h = [IntPtr][int64]$c.alca
-        if (-not [QV]::IsWindow($h)) { Responder @{ id = $c.id; ok = $false; erro = 'janela sumiu' }; break }
-        [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $true)
-        if ($c.frente) { [void][QV]::SetWindowPos($h, [IntPtr]0, 0, 0, 0, 0, 0x0043) } # TOP sem mover nem redimensionar
-        Responder @{ id = $c.id; ok = $true }
-      }
-      'acordar' {
-        # Depois de restaurar a janela do app, o painel pode ficar parado achando que continua
-        # escondido. Isso empurra: mostra, forca recalculo de moldura e manda redesenhar.
-        $h = [IntPtr][int64]$c.alca
-        if (-not [QV]::IsWindow($h)) { Responder @{ id = $c.id; ok = $false; erro = 'janela sumiu' }; break }
-        [void][QV]::ShowWindow($h, $SW_SHOW)
-        # Sem levantar, a superficie de desenho do app volta por cima e engole os cliques.
-        $SWP_NOMOVE = 0x0002; $SWP_NOSIZE = 0x0001; $SWP_FRAMECHANGED = 0x0020
-        [void][QV]::SetWindowPos($h, [IntPtr]0, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_FRAMECHANGED))
-        $RDW_INVALIDATE = 0x0001; $RDW_ALLCHILDREN = 0x0080; $RDW_UPDATENOW = 0x0100
-        [void][QV]::RedrawWindow($h, [IntPtr]0, [IntPtr]0, ($RDW_INVALIDATE -bor $RDW_ALLCHILDREN -bor $RDW_UPDATENOW))
-        Responder @{ id = $c.id; ok = $true }
+        Responder @{ id = $c.id; ok = $true; fora = $fora; recortados = $recortados }
       }
       'reencaixar' {
         # Reafirma o pai sem passar por janela solta (nao pisca), forca um redimensionamento de
@@ -359,25 +399,32 @@ while ($true) {
         $h = [IntPtr][int64]$c.alca
         $pai = [IntPtr][int64]$c.pai
         if (-not [QV]::IsWindow($h)) { Responder @{ id = $c.id; ok = $false; erro = 'janela sumiu' }; break }
-        [void][QV]::SetParent($h, $pai)
-        [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w - 8, [int]$c.h - 8, $true)
-        [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $true)
-        if ($c.recorte -and [int]$c.recorte -gt 0) {
-          $rgn = [QV]::CreateRectRgn(0, [int]$c.recorte, [int]$c.w, [int]$c.h)
-          [void][QV]::SetWindowRgn($h, $rgn, $true)
+        # A danca completa (encolhe, cresce, recorta, redesenha) era o que acordava um painel que
+        # voltou do minimizado achando que continuava escondido. Mas redimensionar o Chrome e uma
+        # piscada por painel, e o app fazia isso varias vezes a cada volta. Agora ela so roda quando
+        # o painel esta de fato fora do lugar (pai, posicao, tamanho ou visibilidade errados).
+        # Painel que ja esta no lugar so e levantado, sem repintar nada.
+        $visivel = ($c.visivel -ne $false)
+        $completo = -not [QV]::NoLugar($h, $pai, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $visivel)
+        if ($completo) {
+          [void][QV]::SetParent($h, $pai)
+          # O tamanho intermediario nunca precisa aparecer: sem pintura aqui, pinta so no final.
+          [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w - 8, [int]$c.h - 8, $false)
+          [void][QV]::MoveWindow($h, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $true)
+          if ($c.recorte -and [int]$c.recorte -gt 0) {
+            [void](Recortar $h ([int]$c.recorte) ([int]$c.w) ([int]$c.h) $true)
+          }
+          Mostrar $h $visivel
         }
-        [void][QV]::ShowWindow($h, $SW_SHOW)
-        [void][QV]::SetWindowPos($h, [IntPtr]0, 0, 0, 0, 0, 0x0003)   # TOP, sem mover nem redimensionar
-        $RDW_INVALIDATE = 0x0001; $RDW_ALLCHILDREN = 0x0080; $RDW_UPDATENOW = 0x0100
-        [void][QV]::RedrawWindow($h, [IntPtr]0, [IntPtr]0, ($RDW_INVALIDATE -bor $RDW_ALLCHILDREN -bor $RDW_UPDATENOW))
-        [QV]::Reativar($h, $pai)
-        Responder @{ id = $c.id; ok = $true }
-      }
-      'reativar' {
-        $h = [IntPtr][int64]$c.alca
-        if (-not [QV]::IsWindow($h)) { Responder @{ id = $c.id; ok = $false; erro = 'janela sumiu' }; break }
-        [QV]::Reativar($h, [IntPtr][int64]$c.pai)
-        Responder @{ id = $c.id; ok = $true }
+        if ($c.levantar -ne $false) {
+          [void][QV]::SetWindowPos($h, [IntPtr]0, 0, 0, 0, 0, 0x0013)   # TOP, sem mover, redimensionar nem ativar
+        }
+        if ($completo -and $visivel) {
+          $RDW_INVALIDATE = 0x0001; $RDW_ALLCHILDREN = 0x0080; $RDW_UPDATENOW = 0x0100
+          [void][QV]::RedrawWindow($h, [IntPtr]0, [IntPtr]0, ($RDW_INVALIDATE -bor $RDW_ALLCHILDREN -bor $RDW_UPDATENOW))
+        }
+        if ($visivel) { [QV]::Reativar($h, $pai) } else { [void][QV]::Grudar($h, $pai) }
+        Responder @{ id = $c.id; ok = $true; completo = $completo; noLugar = [QV]::NoLugar($h, $pai, [int]$c.x, [int]$c.y, [int]$c.w, [int]$c.h, $visivel) }
       }
       'focar' {
         # Teclado para este painel. SetFocus sozinho nao atravessa processo: sem grudar a fila ele

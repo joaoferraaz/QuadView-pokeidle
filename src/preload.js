@@ -13,5 +13,4 @@ contextBridge.exposeInMainWorld('quad', {
   extAtualizar: (id) => ipcRenderer.invoke('ext:atualizar', id),
   extPagina: (id) => ipcRenderer.send('ext:pagina', id),
   onEstado: (cb) => ipcRenderer.on('estado', (_e, s) => cb(s)),
-  onAviso: (cb) => ipcRenderer.on('aviso', (_e, t) => cb(t)),
 });
