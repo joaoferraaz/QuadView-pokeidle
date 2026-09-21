@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'">
+<title>Acesso</title>
+<style>
+  :root { --bg:#0a0f18; --panel:#111a28; --line:#1e2b40; --text:#dbe6f5; --dim:#7f91ab; --cyan:#3fd8ff; --magenta:#ff4fa3; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.45 "Segoe UI", system-ui, sans-serif; padding: 22px; }
+  h1 { font-size: 15px; margin-bottom: 4px; } h1 b { color: var(--cyan); }
+  p { color: var(--dim); font-size: 12px; margin-bottom: 14px; }
+  label { display: block; color: var(--dim); font-size: 12px; margin: 10px 0 4px; }
+  input { width: 100%; height: 34px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); outline: none; }
+  input:focus, select:focus { border-color: var(--cyan); }
+  select { width: 100%; height: 34px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); outline: none; font: inherit; }
+  #explica { margin: 8px 0 4px; min-height: 34px; }
+  [hidden] { display: none !important; }
+  .row { display: flex; gap: 8px; margin-top: 18px; align-items: center; }
+  .spacer { flex: 1; }
+  button { height: 34px; padding: 0 14px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); cursor: pointer; font: inherit; }
+  button.primary { background: var(--cyan); border-color: var(--cyan); color: #04121a; font-weight: 600; }
+  button.danger:hover { border-color: var(--magenta); color: var(--magenta); }
+  #msg { color: var(--magenta); font-size: 12px; min-height: 16px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1><b>[</b> <span id="nome"></span> <b>]</b></h1>
+  <form id="f">
+    <label for="metodo">Como este painel entra no jogo</label>
+    <select id="metodo">
+      <option value="">Seguir o padrão do app</option>
+      <option value="formulario">Usuário e senha</option>
+      <option value="google">Entrar com Google</option>
+      <option value="nenhum">Não fazer nada</option>
+    </select>
+    <p id="explica"></p>
+    <div id="campos">
+    <label for="user">Email ou nome de usuário</label>
+    <input id="user" autocomplete="off" spellcheck="false">
+    <label for="pass">Senha</label>
+    <input id="pass" type="password" autocomplete="off">
+    </div>
+    <div id="msg"></div>
+    <div class="row">
+      <button type="button" class="danger" id="limpar">Esquecer</button>
+      <span class="spacer"></span>
+      <button type="button" id="cancelar">Cancelar</button>
+      <button type="submit" class="primary">Salvar</button>
+    </div>
+  </form>
+  <script src="creds.js"></script>
+</body>
+</html>

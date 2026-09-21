@@ -1,0 +1,45 @@
+{
+  "name": "quadview-solo",
+  "version": "1.0.0",
+  "description": "Quatro sessoes isoladas de um jogo de navegador encaixadas numa janela unica, com login por painel, reconexao automatica e extensoes",
+  "main": "src/main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable --publish never",
+    "test": "node test/win32-guard.js && node test/ponte-guard.js && node test/migracao-test.js && node test/empacotamento-test.js && node test/extensoes-test.js",
+    "test:navegador": "node test/extensoes-navegador-test.js",
+    "test:e2e": "node test/e2e-embed.js"
+  },
+  "devDependencies": {
+    "electron": "^44.4.3",
+    "electron-builder": "^26.15.3",
+    "ws": "^8.21.3"
+  },
+  "build": {
+    "appId": "online.quadview.solo",
+    "productName": "QuadView",
+    "files": [
+      "src/**/*",
+      "config.json",
+      "package.json",
+      "build/icon.ico"
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "QuadView.exe"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "src/win32.ps1",
+      "build/icon.ico"
+    ],
+    "compression": "maximum"
+  }
+}

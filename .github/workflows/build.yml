@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Os testes deste job sao Node puro: nao precisam do binario do Electron.
+      - run: npm ci --ignore-scripts
+      - run: npm test
+
+  windows:
+    # So em tag (v1.2.3): compila o portatil e anexa na Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: testes
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run dist
+      - name: SHA-256 do executavel
+        shell: pwsh
+        run: (Get-FileHash dist/QuadView.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii dist/QuadView.exe.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/QuadView.exe
+            dist/QuadView.exe.sha256
+          generate_release_notes: true

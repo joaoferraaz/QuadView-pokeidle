@@ -1,0 +1,15 @@
+# dependencias e build
+node_modules/
+dist/
+
+# o executavel e as partes dele vao em Releases, nunca no repositorio (passam de 90 MB)
+QuadView.exe
+QuadView.parte*
+montar-QuadView.bat
+
+# sistema e editor
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

@@ -1,0 +1,47 @@
+{
+  "url": "https://poke.idleworld.online/play",
+  "porta": 47900,
+  "reconectar": true,
+  "detectarTravado": true,
+  "minutosTravado": 5,
+  "perfis": [
+    {
+      "nome": "Conta 1",
+      "slug": "conta-1",
+      "url": ""
+    },
+    {
+      "nome": "Conta 2",
+      "slug": "conta-2",
+      "url": ""
+    },
+    {
+      "nome": "Conta 3",
+      "slug": "conta-3",
+      "url": ""
+    },
+    {
+      "nome": "Conta 4",
+      "slug": "conta-4",
+      "url": ""
+    }
+  ],
+  "abrirAoIniciar": true,
+  "preencherLogin": true,
+  "recorteTitulo": 34,
+  "modo": "grade",
+  "extras": [
+    {
+      "nome": "PIW Tools",
+      "slug": "piw-tools",
+      "url": "https://piwtools.com.br/"
+    },
+    {
+      "nome": "PokePedia",
+      "slug": "pokepedia",
+      "url": "https://poke.idleworld.online/pokepedia"
+    }
+  ],
+  "metodoLogin": "formulario",
+  "argsExtras": ""
+}
